@@ -31,7 +31,7 @@ export async function cleanupOldData(): Promise<MaintenanceResult> {
   });
 
   const tableRows = (await prisma.$queryRawUnsafe(
-    "SELECT to_regclass('public.scan_notification_throttle') AS name",
+    "SELECT to_regclass('public.scan_notification_throttle')::text AS name",
   )) as Array<{ name: string | null }>;
   let deletedThrottleRows = 0;
   if (tableRows[0]?.name === THROTTLE_TABLE_NAME) {
