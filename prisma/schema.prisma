@@ -1,0 +1,35 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model AmazonRescheduleEmail {
+  id                  String   @id @default(uuid())
+  emailAccount        String
+  region              String
+  warehouse           String
+  appointmentId       String
+  appointmentTimeText String
+  subject             String
+  fromEmail           String
+  receivedAt          DateTime
+  gmailMessageId      String
+  createdAt           DateTime @default(now())
+
+  @@unique([emailAccount, appointmentId])
+  @@index([receivedAt(sort: Desc)])
+  @@index([region])
+  @@index([warehouse])
+  @@index([emailAccount])
+  @@index([appointmentId])
+  @@index([gmailMessageId])
+}
