@@ -81,12 +81,19 @@ Manual **Scan Now** remains unchanged.
 For unattended scans, this repo includes:
 
 - `GET /api/scan-gmail/cron` (protected by bearer secret)
-- `vercel.json` cron schedule: `0 */2 * * *`
+- `vercel.json` cron schedule: `0 */2 * * *` (works on Vercel plans that allow sub-daily cron)
+- GitHub Actions workflow: `.github/workflows/scan-cron.yml` (recommended for Vercel Hobby)
 
 Setup:
 
 1. In deployment env vars, set either `CRON_SECRET` (recommended on Vercel) or `SCAN_CRON_SECRET`.
-2. Deploy. Vercel Cron will call `/api/scan-gmail/cron` every 2 hours.
+2. Deploy.
+3. Choose one scheduler:
+   - **Vercel Cron**: if your Vercel plan supports `0 */2 * * *`.
+   - **GitHub Actions** (Hobby-friendly): add repo secrets:
+     - `APP_BASE_URL` (e.g. `https://your-app.vercel.app`)
+     - `CRON_SECRET` (must match runtime env value in your app)
+     Then enable Actions; workflow `Gmail Scan Cron` will trigger every 2 hours (UTC).
 
 Security behavior:
 

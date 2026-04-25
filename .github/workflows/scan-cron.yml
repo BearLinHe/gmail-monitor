@@ -1,0 +1,44 @@
+name: Gmail Scan Cron
+
+on:
+  schedule:
+    # Every 2 hours (UTC)
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+jobs:
+  trigger-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Trigger scan endpoint
+        env:
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APP_BASE_URL:-}" ]; then
+            echo "APP_BASE_URL is missing"
+            exit 1
+          fi
+
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "CRON_SECRET is missing"
+            exit 1
+          fi
+
+          URL="${APP_BASE_URL%/}/api/scan-gmail/cron"
+          echo "Calling ${URL}"
+
+          HTTP_STATUS="$(curl -sS -o response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            "${URL}")"
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          cat response.json
+
+          if [ "${HTTP_STATUS}" -lt 200 ] || [ "${HTTP_STATUS}" -ge 300 ]; then
+            echo "Scan endpoint failed"
+            exit 1
+          fi
