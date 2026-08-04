@@ -52,7 +52,7 @@ const DEFAULT_ACCOUNTS = [
   "wgustruckingllc@gmail.com",
   "kindaglobalinc@gmail.com",
   "alreadyarrivedlogistics@gmail.com",
-  "info.ygtruckingllc@gmail.com",
+  "dispatch@ygtrucking.llc",
 ];
 
 /** Stable palette per warehouse code for left bar + badge. */
