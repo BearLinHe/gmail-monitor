@@ -36,7 +36,7 @@ jobs:
             "${URL}")"
 
           echo "HTTP status: ${HTTP_STATUS}"
-          cat response.json
+          jq '{success, scannedAccounts, inserted, skipped, failedAccounts: ([.accounts[]? | select(.ok == false)] | length)}' response.json || true
 
           if [ "${HTTP_STATUS}" -lt 200 ] || [ "${HTTP_STATUS}" -ge 300 ]; then
             echo "Scan endpoint failed"

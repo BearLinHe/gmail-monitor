@@ -1,11 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import type { Prisma } from "@/generated/prisma/client";
+import { getMonitorSession } from "@/lib/monitorAuth";
 import { prisma } from "@/lib/prisma";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest) {
+  if (!getMonitorSession(request)) {
+    return NextResponse.json({ error: "Sign in to the monitor first.", data: [] }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const region = searchParams.get("region")?.trim();
   const warehouse = searchParams.get("warehouse")?.trim();

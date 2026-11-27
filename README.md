@@ -1,22 +1,12 @@
 # Gmail Amazon reschedule monitor
 
-Next.js dashboard that scans multiple Gmail inboxes over IMAP, finds **Amazon Carrier Central** messages whose subjects match the warehouse reschedule pattern, and stores them in PostgreSQL via Prisma.
+Next.js dashboard that scans authorized Gmail inboxes for **Amazon Carrier Central** reschedule messages and stores matching appointment details in PostgreSQL. Connect Gmail and Google Workspace inboxes through the Gmail API. Existing IMAP accounts can continue scanning while you migrate them.
 
 ## Prerequisites
 
 - Node.js 20+ (see Prisma 7 engine notes in the install log if you use an older runtime)
 - PostgreSQL instance and a `DATABASE_URL`
-- Gmail **App Passwords** for each monitored account (2-Step Verification must be enabled on the Google account)
-
-## Gmail App Passwords
-
-1. Open [Google Account security](https://myaccount.google.com/security).
-2. Enable **2-Step Verification** if it is not already on.
-3. Open [App passwords](https://myaccount.google.com/apppasswords) (Google may label this “App passwords” under 2-Step Verification).
-4. Create an app password for **Mail** (device can be “Other” — e.g. “gmail-monitor”).
-5. Copy the 16-character password (no spaces) and put it in `GMAIL_ACCOUNTS_JSON` for that account’s `appPassword` field in `.env.local`.
-
-Repeat for each Gmail address you monitor. Never reuse a screenshot or chat to store these; keep them only in local env files.
+- Google Cloud Web OAuth client with Gmail API enabled for adding or reconnecting inboxes
 
 ## Setup
 
@@ -32,17 +22,9 @@ Repeat for each Gmail address you monitor. Never reuse a screenshot or chat to s
    cp .env.example .env.local
    ```
 
-3. Set `DATABASE_URL` in `.env.local` to your Postgres URL.
+3. Set `DATABASE_URL` in `.env.local` to your Postgres URL. Set `GMAIL_MONITOR_ADMIN_PASSWORD` to a randomly generated console password (`openssl rand -hex 32`). The dashboard data and manual scan endpoints require a signed-in operator. This console is intended for trusted staff who may see all monitored inboxes.
 
-4. Set `GMAIL_ACCOUNTS_JSON` to a **JSON array** of objects:
-
-   - `email` — full Gmail address  
-   - `region` — label you want on the dashboard (`SAV`, `OAK`, etc.)  
-   - `appPassword` — the Gmail app password (not your normal Google password)
-
-   Put the JSON on **one line** in `.env.local`, or escape newlines. Do not commit `.env.local` (it is ignored via `.gitignore`).
-
-5. Apply the database schema:
+4. Apply the database schema:
 
    ```bash
    npx prisma migrate deploy
@@ -54,13 +36,28 @@ Repeat for each Gmail address you monitor. Never reuse a screenshot or chat to s
    npx prisma migrate dev
    ```
 
-6. Start the app:
+5. Start the app:
 
    ```bash
    npm run dev
    ```
 
    Open [http://localhost:3000](http://localhost:3000).
+
+## Add and reconnect Gmail inboxes
+
+1. In Google Cloud, enable Gmail API and configure the OAuth consent screen. Use **External** to support personal Gmail and Workspace inboxes outside your Google Cloud organization. While the OAuth app is in Testing, add each mailbox as a Google test user. Gmail refresh tokens in External Testing expire after seven days. To let operators add new inboxes without managing the test-user list, publish the OAuth app and meet Google's applicable restricted-scope verification requirements. See [Google OAuth app states](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview) and [restricted-scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification).
+2. Create a **Web application** OAuth client. Add `http://localhost:3000/api/gmail-connections/callback` for local testing or `https://your-app.example.com/api/gmail-connections/callback` for deployment as an authorized redirect URI. The OAuth callback must use the same origin that operators open.
+3. Set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and the matching `GOOGLE_OAUTH_REDIRECT_URI` in the server environment. Generate `GMAIL_OAUTH_TOKEN_KEY` with `openssl rand -base64 32`. Keep that key stable across deployments to allow the app to decrypt existing authorizations. Use a separate database and OAuth configuration for isolated testing.
+4. Open `/gmail-connections`, sign in with the console password, then enter the email address and region and continue to Google. Complete sign-in and consent in Google's page. Once the address and offline access have been verified, the app automatically includes it in the next manual or scheduled scan. Refresh the list to see the latest successful scan time. If Google revokes access, use **Reconnect** on that account.
+
+The app requests Gmail read-only access so it can search for reschedule subjects in Gmail. Actual message requests fetch the needed headers and received timestamp. Refresh tokens are encrypted in PostgreSQL and Gmail passwords are entered only on Google's page.
+
+### Migrate existing mailboxes
+
+Keep existing server-side `GMAIL_ACCOUNTS_JSON` entries during rollout. Each legacy entry has an `email`, `region`, and Gmail `appPassword`. Open the account's **Connect with Google** action. The app replaces IMAP for that address once OAuth has been verified. Briefly losing OAuth access will require reconnecting that mailbox, and other mailboxes continue scanning. After a successful scheduled scan for a migrated mailbox, remove the matching legacy entry. Remove `GMAIL_ACCOUNTS_JSON` once every mailbox has moved to OAuth.
+
+To validate the production path before removing legacy entries, connect a mailbox, run the **Gmail Scan Cron** GitHub Actions workflow, and confirm **Last successful scan** on the mailbox. On an isolated test mailbox, revoke the app's access in Google, run the workflow again, confirm **Needs reconnection**, then reconnect and verify a new successful scheduled scan.
 
 ## Scanning
 
@@ -70,30 +67,19 @@ Repeat for each Gmail address you monitor. Never reuse a screenshot or chat to s
   POST /api/scan-gmail
   ```
 
-  Response JSON includes `scannedAccounts`, `inserted`, `skipped`, and an `accounts` array with per-account `ok`, `inserted`, `skipped`, and `error` if login or IMAP failed for that inbox. Other accounts are still processed.
+  The manual endpoint requires a valid console session. Response JSON includes `scannedAccounts`, `inserted`, `skipped`, and an `accounts` array with individual mailbox results. One mailbox's authorization failure does not prevent scanning the others.
 
-- The scanner connects to `imap.gmail.com:993` (TLS), opens `INBOX`, and searches with Gmail `X-GM-RAW`: **`newer_than:ceil(N/24)d`** plus **RESCHEDULE** / **Appointment** in the subject, where **N** is `SCAN_LOOKBACK_HOURS` (default **72** hours). After fetch, only messages whose **INTERNALDATE** (received in Gmail) falls within the last **N** hours are kept, then the subject must match the warehouse reschedule regex. One row per inbox + appointment id (latest `INTERNALDATE` wins on upsert). If `X-GM-RAW` fails, it falls back to IMAP `SUBJECT RESCHEDULE` (newest 5000 UIDs if huge).
+- Both Gmail API and legacy IMAP scans look for **RESCHEDULE** and **Appointment** in the subject and use `SCAN_LOOKBACK_HOURS` (default **72** hours). The timestamp must fall in the lookback window and the subject must match the pattern below. The newest message wins for each mailbox and appointment ID. Legacy IMAP uses All Mail when available and falls back to INBOX.
 
 ### Automatic scan every 2 hours (works even if page is closed)
 
-Manual **Scan Now** remains unchanged.
-
-For unattended scans, this repo includes:
-
-- `GET /api/scan-gmail/cron` (protected by bearer secret)
-- `vercel.json` cron schedule: `0 */2 * * *` (works on Vercel plans that allow sub-daily cron)
-- GitHub Actions workflow: `.github/workflows/scan-cron.yml` (recommended for Vercel Hobby)
+The GitHub Actions workflow in `.github/workflows/scan-cron.yml` calls the bearer-protected `GET /api/scan-gmail/cron` endpoint every two hours. Every connected mailbox is picked up automatically. Keep the scheduled endpoint accessible to the workflow.
 
 Setup:
 
 1. In deployment env vars, set either `CRON_SECRET` (recommended on Vercel) or `SCAN_CRON_SECRET`.
 2. Deploy.
-3. Choose one scheduler:
-   - **Vercel Cron**: if your Vercel plan supports `0 */2 * * *`.
-   - **GitHub Actions** (Hobby-friendly): add repo secrets:
-     - `APP_BASE_URL` (e.g. `https://your-app.vercel.app`)
-     - `CRON_SECRET` (must match runtime env value in your app)
-     Then enable Actions; workflow `Gmail Scan Cron` will trigger every 2 hours (UTC).
+3. In GitHub, set the repository secrets `APP_BASE_URL` (the deployed monitor URL) and `CRON_SECRET` (the same value as the app's scheduler secret). Enable **Gmail Scan Cron**.
 
 Security behavior:
 

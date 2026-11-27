@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Row = {
   id: string;
@@ -45,15 +46,19 @@ type ScanResponse = {
   error?: string;
 };
 
+type MailboxDirectory = {
+  adminConfigured: boolean;
+  authenticated: boolean;
+  accounts: { email: string; region: string }[];
+};
+
+type ScanMessage = {
+  text: string;
+  level: "success" | "warning" | "error";
+};
+
 const ALERTS_READ_KEY = "gmail-monitor-alerts-read-ids";
 const RECENT_ALERT_LIMIT = 20;
-
-const DEFAULT_ACCOUNTS = [
-  "wgustruckingllc@gmail.com",
-  "kindaglobalinc@gmail.com",
-  "alreadyarrivedlogistics@gmail.com",
-  "dispatch@ygtrucking.llc",
-];
 
 /** Stable palette per warehouse code for left bar + badge. */
 const WAREHOUSE_PALETTE = [
@@ -133,8 +138,11 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [scanMessage, setScanMessage] = useState<string | null>(null);
+  const [scanMessage, setScanMessage] = useState<ScanMessage | null>(null);
   const [lastScanAccounts, setLastScanAccounts] = useState<AccountScanResult[] | null>(null);
+  const [mailboxes, setMailboxes] = useState<MailboxDirectory["accounts"] | null>(null);
+  const [requiresSignIn, setRequiresSignIn] = useState(false);
+  const rowsRequest = useRef<AbortController | null>(null);
 
   const [region, setRegion] = useState("");
   const [warehouse, setWarehouse] = useState("");
@@ -166,36 +174,88 @@ export default function Home() {
     [allAlerts, readAlertIds],
   );
 
+  const handleUnauthorized = useCallback(() => {
+    setRequiresSignIn(true);
+    setRows([]);
+    setMailboxes(null);
+    setLastScanAccounts(null);
+    setScanMessage(null);
+    setEmailAccount("");
+    setRegion("");
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch("/api/gmail-connections", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const directory: MailboxDirectory = await response.json();
+        if (controller.signal.aborted) return;
+        if (directory.adminConfigured && !directory.authenticated) {
+          handleUnauthorized();
+        } else if (directory.authenticated) {
+          setMailboxes(directory.accounts);
+        }
+      } catch {
+        // Reschedule rows continue to work if the mailbox directory is unavailable.
+      }
+    })();
+    return () => controller.abort();
+  }, [handleUnauthorized]);
+
   /**
    * @param queryOverride - when `""`, fetch all rows (no filters). When `undefined`, use current filter state.
    */
   const loadRows = useCallback(
     async (queryOverride?: string) => {
       const suffix = queryOverride !== undefined ? queryOverride : queryString;
+      rowsRequest.current?.abort();
+      const controller = new AbortController();
+      rowsRequest.current = controller;
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(`/api/reschedule-emails${suffix}`, { cache: "no-store" });
+        const res = await fetch(`/api/reschedule-emails${suffix}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        if (res.status === 401) {
+          handleUnauthorized();
+          return;
+        }
         if (!res.ok) {
           const body = await res.json().catch(() => ({}));
           throw new Error(body.error ?? `Request failed (${res.status})`);
         }
         const json = await res.json();
-        setRows(json.data ?? []);
+        if (!controller.signal.aborted) {
+          setRequiresSignIn(false);
+          setRows(json.data ?? []);
+        }
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to load data");
+        if (!controller.signal.aborted) {
+          setError(e instanceof Error ? e.message : "Failed to load data");
+        }
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) setLoading(false);
       }
     },
-    [queryString],
+    [handleUnauthorized, queryString],
   );
 
   useEffect(() => {
     const t = setTimeout(() => {
       void loadRows();
     }, 0);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(t);
+      rowsRequest.current?.abort();
+    };
   }, [loadRows]);
 
   useEffect(() => {
@@ -242,19 +302,35 @@ export default function Home() {
     setLastScanAccounts(null);
     try {
       const res = await fetch("/api/scan-gmail", { method: "POST", cache: "no-store" });
+      if (res.status === 401) {
+        rowsRequest.current?.abort();
+        setLoading(false);
+        handleUnauthorized();
+        return;
+      }
       const json: ScanResponse = await res.json();
       if (!res.ok) {
         throw new Error(json.error ?? `Scan failed (${res.status})`);
       }
       setLastScanAccounts(json.accounts ?? null);
+      if (!json.success) {
+        setScanMessage({ text: "Scan failed for every account. Check the per-account results below.", level: "error" });
+        return;
+      }
+      const failedAccounts = json.accounts?.filter((account) => !account.ok).length ?? 0;
       // Filters (e.g. old Appointment ID) would hide newly scanned rows — clear and reload full list.
       setRegion("");
       setWarehouse("");
       setEmailAccount("");
       setAppointmentId("");
-      setScanMessage(
-        `Scan complete: saved ${json.inserted}, skipped ${json.skipped} (older duplicate in same batch) — ${json.scannedAccounts} accounts. Filters were reset so the table shows all rows.`,
-      );
+      const summary = `Saved ${json.inserted}, skipped ${json.skipped} across ${json.scannedAccounts} accounts.`;
+      setScanMessage(failedAccounts > 0 ? {
+        text: `Scan finished with ${failedAccounts} account failure${failedAccounts === 1 ? "" : "s"}. ${summary}`,
+        level: "warning",
+      } : {
+        text: `Scan complete. ${summary}`,
+        level: "success",
+      });
       await loadRows("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Scan failed");
@@ -264,17 +340,21 @@ export default function Home() {
   }
 
   const regionOptions = useMemo(() => {
-    const s = new Set<string>();
+    const s = new Set(mailboxes?.map((mailbox) => mailbox.region));
     rows.forEach((r) => s.add(r.region));
+    if (region) s.add(region);
     return Array.from(s).sort();
-  }, [rows]);
+  }, [mailboxes, region, rows]);
 
   const accountOptions = useMemo(() => {
-    const s = new Set<string>(DEFAULT_ACCOUNTS);
+    const s = new Set(mailboxes?.map((mailbox) => mailbox.email));
+    lastScanAccounts?.forEach((account) => s.add(account.email));
     rows.forEach((r) => s.add(r.emailAccount));
+    if (emailAccount) s.add(emailAccount);
     return Array.from(s).sort();
-  }, [rows]);
+  }, [mailboxes, lastScanAccounts, rows, emailAccount]);
 
+  const trackedCount = mailboxes?.length ?? lastScanAccounts?.length;
   const failedLastScanCount = (lastScanAccounts ?? []).filter((a) => !a.ok).length;
 
   return (
@@ -286,7 +366,7 @@ export default function Home() {
               Amazon Carrier Central — reschedule inbox
             </h1>
             <p className="text-sm text-[#3E4E59]">
-              IMAP scan of Gmail accounts; matches warehouse reschedule subject lines.
+              Watches Gmail accounts for warehouse reschedule emails.
             </p>
             <div className="mt-2">
               <button
@@ -307,18 +387,32 @@ export default function Home() {
               </button>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => void handleScan()}
-            disabled={scanning}
-            className="inline-flex shrink-0 items-center justify-center rounded-lg bg-[#1387C0] px-5 py-2.5 text-sm font-medium text-white shadow-md hover:bg-[#0F6F9F] disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {scanning ? "Scanning…" : "Scan Now"}
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href="/gmail-connections"
+              className="inline-flex items-center justify-center rounded-lg border border-[#1387C0]/25 bg-white px-4 py-2.5 text-sm font-medium text-[#0F6F9F] hover:bg-[#E9F6FC]"
+            >
+              Gmail accounts
+            </Link>
+            <button
+              type="button"
+              onClick={() => void handleScan()}
+              disabled={scanning || requiresSignIn}
+              className="inline-flex shrink-0 items-center justify-center rounded-lg bg-[#1387C0] px-5 py-2.5 text-sm font-medium text-white shadow-md hover:bg-[#0F6F9F] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {scanning ? "Scanning…" : "Scan Now"}
+            </button>
+          </div>
         </div>
       </header>
 
       <main className={`${shellClass} mx-auto max-w-[2200px] space-y-5 py-6`}>
+        {requiresSignIn ? (
+          <div className="rounded-lg border border-[#1387C0]/25 bg-[#E9F6FC] px-4 py-3 text-sm text-[#0F6F9F] shadow-sm" role="status">
+            <Link href="/gmail-connections" className="font-semibold underline">Sign in to the monitoring console</Link>
+            {" "}to view monitored email and run scans.
+          </div>
+        ) : null}
         {error ? (
           <div
             className="rounded-lg border border-[#F4520D]/30 bg-[#FFF1EB] px-4 py-3 text-sm text-[#A63B0A] shadow-sm"
@@ -329,8 +423,13 @@ export default function Home() {
         ) : null}
 
         {scanMessage ? (
-          <div className="rounded-lg border border-[#1387C0]/25 bg-[#E9F6FC] px-4 py-3 text-sm text-[#0F6F9F] shadow-sm">
-            {scanMessage}
+          <div
+            className={`rounded-lg border px-4 py-3 text-sm shadow-sm ${scanMessage.level === "success"
+              ? "border-[#1387C0]/25 bg-[#E9F6FC] text-[#0F6F9F]"
+              : "border-[#F4520D]/30 bg-[#FFF1EB] text-[#A63B0A]"}`}
+            role={scanMessage.level === "error" ? "alert" : "status"}
+          >
+            {scanMessage.text}
           </div>
         ) : null}
         <div className="grid gap-5 xl:grid-cols-12 xl:items-start">
@@ -346,7 +445,7 @@ export default function Home() {
               </div>
               <div className="rounded-xl border border-[#E2D1AD] bg-[#FFF9ED] p-4 shadow-sm">
                 <p className="text-xs uppercase tracking-wide text-[#4E5A62]">Accounts tracked</p>
-                <p className="mt-1 text-2xl font-semibold text-[#0F6F9F]">{accountOptions.length}</p>
+                <p className="mt-1 text-2xl font-semibold text-[#0F6F9F]">{trackedCount ?? "—"}</p>
               </div>
               <div className="rounded-xl border border-[#E2D1AD] bg-[#FFF9ED] p-4 shadow-sm">
                 <p className="text-xs uppercase tracking-wide text-[#4E5A62]">Last scan failures</p>
@@ -482,8 +581,7 @@ export default function Home() {
                 {rows.length === 0 && !loading ? (
                   <tr>
                     <td colSpan={7} className="px-4 py-12 text-center text-[#4E5A62]">
-                      No rows yet. Configure <code className="rounded bg-[#FAEDD1] px-1.5 py-0.5">.env.local</code>{" "}
-                      and click <strong>Scan Now</strong>.
+                      {requiresSignIn ? "Sign in to view reschedule emails." : "No matching reschedule emails."}
                     </td>
                   </tr>
                 ) : null}

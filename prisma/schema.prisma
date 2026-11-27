@@ -33,3 +33,13 @@ model AmazonRescheduleEmail {
   @@index([appointmentId])
   @@index([gmailMessageId])
 }
+
+model GmailConnection {
+  email                 String    @id
+  region                String
+  encryptedRefreshToken String
+  authorizationId       String
+  needsReconnect        Boolean   @default(false)
+  lastScanAt            DateTime?
+  updatedAt             DateTime  @updatedAt
+}

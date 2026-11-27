@@ -1,11 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import {
-  parseGmailAccountsFromEnvDetailed,
-  scanAllGmailAccounts,
-} from "@/lib/gmailScanner";
-import { cleanupOldData } from "@/lib/dataMaintenance";
-import { notifyWechatIfNeeded } from "@/lib/wechatNotifier";
+import { runGmailScan } from "@/lib/gmailScanJob";
+import { secretsMatch } from "@/lib/monitorAuth";
 
 export const dynamic = "force-dynamic";
 
@@ -35,52 +31,16 @@ export async function GET(request: NextRequest) {
   const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
   const querySecret = request.nextUrl.searchParams.get("secret")?.trim() ?? "";
   const provided = bearer || querySecret;
-  if (provided !== secret) {
+  if (!secretsMatch(provided, secret)) {
     return unauthorized();
   }
 
-  const { accounts, error: parseError } = parseGmailAccountsFromEnvDetailed();
-  if (accounts.length === 0) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: parseError ?? "No valid Gmail accounts in GMAIL_ACCOUNTS_JSON",
-        scannedAccounts: 0,
-        inserted: 0,
-        skipped: 0,
-        accounts: [],
-      },
-      { status: 400 },
-    );
-  }
-
   try {
-    const result = await scanAllGmailAccounts();
-    await notifyWechatIfNeeded(result, "cron");
-    const maintenance = await cleanupOldData();
-    return NextResponse.json({
-      success: result.success,
-      trigger: "cron",
-      scannedAccounts: result.scannedAccounts,
-      inserted: result.inserted,
-      skipped: result.skipped,
-      accounts: result.accounts,
-      highlights: result.highlights,
-      maintenance,
-    });
-  } catch (e) {
-    const message = e instanceof Error ? e.message : "Scan failed";
-    console.error("[api/scan-gmail/cron]", message, e);
-    return NextResponse.json(
-      {
-        success: false,
-        error: message,
-        scannedAccounts: accounts.length,
-        inserted: 0,
-        skipped: 0,
-        accounts: [],
-      },
-      { status: 500 },
-    );
+    const result = await runGmailScan("cron");
+    const status = !result.scannedAccounts ? 400 : result.success ? 200 : 502;
+    return NextResponse.json({ ...result, trigger: "cron" }, { status, headers: { "Cache-Control": "no-store" } });
+  } catch {
+    console.error("[api/scan-gmail/cron] Could not run the scheduled scan");
+    return NextResponse.json({ success: false, error: "Could not run the scan. Check server settings and logs." }, { status: 500 });
   }
 }

@@ -1,11 +1,21 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 
-import { Prisma } from "@/generated/prisma/client";
+import { Prisma, type GmailConnection } from "@/generated/prisma/client";
+import {
+  type GmailOAuthConfig,
+  decryptGmailRefreshToken,
+  encryptGmailRefreshToken,
+  getGmailOAuthConfig,
+  GmailOAuthError,
+  listGmailRescheduleMessages,
+  refreshGmailAccessToken,
+} from "@/lib/gmailOAuth";
 import { prisma } from "@/lib/prisma";
 
 const SUBJECT_RESCHEDULE_REGEX =
   /^([A-Z0-9]+)\s+RESCHEDULE:\s+Appointment\s+#(\d+),\s+Appointment\s+Time:\s+(.+)$/;
+const CONCURRENT_ACCOUNT_SCANS = 3;
 
 /**
  * Only load RESCHEDULE mail received within this many hours (now − N hours). Keeps scans fast.
@@ -74,6 +84,7 @@ export type AccountScanResult = {
 export type ScanGmailResult = {
   success: boolean;
   scannedAccounts: number;
+  configurationError?: string;
   inserted: number;
   skipped: number;
   accounts: AccountScanResult[];
@@ -134,11 +145,10 @@ function normalizeGmailAccountsJsonEnv(raw: string): string {
 export function parseGmailAccountsFromEnvDetailed(): ParseGmailAccountsResult {
   const raw = process.env.GMAIL_ACCOUNTS_JSON;
   if (!raw?.trim()) {
-    logScanner("error", "GMAIL_ACCOUNTS_JSON is missing or empty");
     return {
       accounts: [],
       error:
-        "GMAIL_ACCOUNTS_JSON is not set. Add it to .env.local (see .env.example): a one-line JSON array of { email, region, appPassword }.",
+        "No monitored mailboxes are configured. Connect an account in Gmail Connections.",
     };
   }
 
@@ -147,12 +157,12 @@ export function parseGmailAccountsFromEnvDetailed(): ParseGmailAccountsResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(normalized);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    logScanner("error", "Failed to parse GMAIL_ACCOUNTS_JSON", { error: msg });
+  } catch {
+    // A native JSON parse error may contain a snippet of the credentials.
+    logScanner("error", "Failed to parse GMAIL_ACCOUNTS_JSON");
     return {
       accounts: [],
-      error: `GMAIL_ACCOUNTS_JSON is not valid JSON (${msg}). Use a single-line array or wrap the whole value in single quotes in .env.local.`,
+      error: "GMAIL_ACCOUNTS_JSON is not valid JSON. Use a single-line JSON array.",
     };
   }
 
@@ -199,6 +209,67 @@ function normalizeMessageId(messageId: string | undefined, email: string, uid: n
     return messageId.trim().replace(/^<|>$/g, "");
   }
   return `${email}::uid:${uid}`;
+}
+
+type RescheduleMessage = {
+  subject: string;
+  fromEmail: string;
+  receivedAt: Date;
+  gmailMessageId: string;
+};
+
+async function saveRescheduleMessage(
+  account: { email: string; region: string },
+  message: RescheduleMessage,
+  match: RegExpMatchArray,
+  result: AccountScanResult,
+): Promise<boolean> {
+  const appointmentId = match[2];
+  const data = {
+    ...message,
+    region: account.region,
+    warehouse: match[1],
+    appointmentTimeText: match[3].trim(),
+  };
+  const key = { emailAccount: account.email, appointmentId };
+
+  try {
+    // Manual and scheduled runs may overlap. Create once, and let Postgres
+    // evaluate the timestamp condition before applying any update.
+    const created = await prisma.amazonRescheduleEmail.createMany({
+      data: { ...key, ...data },
+      skipDuplicates: true,
+    });
+    if (created.count === 0) {
+      const updated = await prisma.amazonRescheduleEmail.updateMany({
+        where: { ...key, receivedAt: { lt: message.receivedAt } },
+        data,
+      });
+      if (updated.count === 0) {
+        result.skipped += 1;
+        return true;
+      }
+    }
+
+    result.inserted += 1;
+    result.highlights?.push({
+      ...key,
+      warehouse: data.warehouse,
+      appointmentTimeText: data.appointmentTimeText,
+      receivedAt: data.receivedAt.toISOString(),
+      action: created.count === 1 ? "created" : "updated",
+    });
+    return true;
+  } catch (error) {
+    const detail = formatPrismaError(error);
+    result.dbError ??= detail;
+    logScanner("error", "Failed to save reschedule email", {
+      email: account.email,
+      appointmentId,
+      error: detail,
+    });
+    return false;
+  }
 }
 
 /** Gmail IMAP INTERNALDATE — when the message was delivered to the mailbox (matches Gmail list time). */
@@ -293,6 +364,9 @@ async function scanAccount(account: GmailAccountConfig): Promise<AccountScanResu
       pass: account.appPassword,
     },
     logger: false,
+    connectionTimeout: 15_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 30_000,
   });
 
   if (account.appPassword.replace(/\s/g, "").length !== 16) {
@@ -459,72 +533,9 @@ async function scanAccount(account: GmailAccountConfig): Promise<AccountScanResu
         }
       }
 
-      const appointmentId = match[2];
-      const rowData = {
-        region: account.region,
-        warehouse: match[1],
-        appointmentTimeText: match[3].trim(),
-        subject,
-        fromEmail,
-        receivedAt,
-        gmailMessageId,
-      };
-
-      try {
-        const existing = await prisma.amazonRescheduleEmail.findUnique({
-          where: {
-            emailAccount_appointmentId: {
-              emailAccount: account.email,
-              appointmentId,
-            },
-          },
-        });
-
-        if (!existing) {
-          await prisma.amazonRescheduleEmail.create({
-            data: {
-              emailAccount: account.email,
-              appointmentId,
-              ...rowData,
-            },
-          });
-          result.inserted += 1;
-          result.highlights?.push({
-            emailAccount: account.email,
-            warehouse: rowData.warehouse,
-            appointmentId,
-            appointmentTimeText: rowData.appointmentTimeText,
-            receivedAt: rowData.receivedAt.toISOString(),
-            action: "created",
-          });
-        } else if (receivedAt.getTime() > existing.receivedAt.getTime()) {
-          await prisma.amazonRescheduleEmail.update({
-            where: { id: existing.id },
-            data: rowData,
-          });
-          result.inserted += 1;
-          result.highlights?.push({
-            emailAccount: account.email,
-            warehouse: rowData.warehouse,
-            appointmentId,
-            appointmentTimeText: rowData.appointmentTimeText,
-            receivedAt: rowData.receivedAt.toISOString(),
-            action: "updated",
-          });
-        } else {
-          result.skipped += 1;
-        }
-      } catch (e: unknown) {
+      const message = { subject, fromEmail, receivedAt, gmailMessageId };
+      if (!(await saveRescheduleMessage(account, message, match, result))) {
         dbFailures += 1;
-        const detail = formatPrismaError(e);
-        if (!result.dbError) {
-          result.dbError = detail;
-        }
-        logScanner("error", "Failed to upsert row", {
-          email: account.email,
-          appointmentId,
-          error: detail,
-        });
       }
     }
 
@@ -535,6 +546,11 @@ async function scanAccount(account: GmailAccountConfig): Promise<AccountScanResu
       secondPullExpected,
       secondPullReturned,
     };
+
+    if (dbFailures > 0) {
+      result.ok = false;
+      result.error = `Could not save ${dbFailures} matching Gmail message(s).`;
+    }
 
     if (
       result.inserted === 0 &&
@@ -582,29 +598,128 @@ async function scanAccount(account: GmailAccountConfig): Promise<AccountScanResu
   return result;
 }
 
-export async function scanAllGmailAccounts(): Promise<ScanGmailResult> {
-  const accounts = parseGmailAccountsFromEnv();
-  const accountsOut: AccountScanResult[] = [];
-  const highlights: ScanGmailResult["highlights"] = [];
-  let inserted = 0;
-  let skipped = 0;
+async function scanOAuthAccount(
+  config: GmailOAuthConfig,
+  connection: GmailConnection,
+): Promise<AccountScanResult> {
+  const { email, authorizationId } = connection;
+  const result: AccountScanResult = { email, ok: false, inserted: 0, skipped: 0, highlights: [] };
 
-  for (const account of accounts) {
-    const one = await scanAccount(account);
-    accountsOut.push(one);
-    if (one.highlights?.length) {
-      highlights.push(...one.highlights);
-    }
-    inserted += one.inserted;
-    skipped += one.skipped;
+  if (connection.needsReconnect) {
+    result.error = "Google authorization expired. Reconnect this mailbox in Gmail Connections.";
+    return result;
   }
 
+  const activeAuthorization = { email, authorizationId, needsReconnect: false };
+  let currentToken = connection.encryptedRefreshToken;
+
+  try {
+    const refreshToken = decryptGmailRefreshToken(config, currentToken, email);
+    const refreshed = await refreshGmailAccessToken(config, refreshToken);
+
+    if (refreshed.refreshToken && refreshed.refreshToken !== refreshToken) {
+      const rotatedToken = encryptGmailRefreshToken(config, refreshed.refreshToken, email);
+      const rotated = await prisma.gmailConnection.updateMany({
+        where: { ...activeAuthorization, encryptedRefreshToken: currentToken },
+        data: { encryptedRefreshToken: rotatedToken },
+      });
+      if (rotated.count === 0) {
+        result.error = "The Gmail authorization changed. Try scanning again.";
+        return result;
+      }
+      currentToken = rotatedToken;
+    }
+
+    const messages = await listGmailRescheduleMessages(refreshed.accessToken, lookbackCutoffMs());
+    messages.sort((a, b) => b.receivedAt.getTime() - a.receivedAt.getTime());
+    const stats = {
+      searchUids: messages.length,
+      fetchedHeaders: messages.length,
+      afterLookbackAndRegex: 0,
+      mailbox: "Gmail API",
+      dbFailures: 0,
+    };
+    result.stats = stats;
+
+    for (const message of messages) {
+      const subject = message.subject.trim();
+      const match = subject.match(SUBJECT_RESCHEDULE_REGEX);
+      if (!match) continue;
+      stats.afterLookbackAndRegex += 1;
+      if (!(await saveRescheduleMessage(connection, { ...message, subject }, match, result))) {
+        stats.dbFailures += 1;
+      }
+    }
+
+    if (stats.dbFailures > 0) {
+      result.error = `Could not save ${stats.dbFailures} matching Gmail message(s).`;
+      return result;
+    }
+
+    await prisma.gmailConnection.updateMany({
+      where: activeAuthorization,
+      data: { lastScanAt: new Date() },
+    });
+    result.ok = true;
+    if (stats.afterLookbackAndRegex === 0) {
+      result.note = `Gmail API found no matching reschedule messages in the last ${getLookbackHours()} hours.`;
+    }
+  } catch (error) {
+    if (error instanceof GmailOAuthError && error.needsReconnect) {
+      try {
+        await prisma.gmailConnection.updateMany({
+          where: { ...activeAuthorization, encryptedRefreshToken: currentToken },
+          data: { needsReconnect: true },
+        });
+        result.error = "Google authorization expired. Reconnect this mailbox in Gmail Connections.";
+        return result;
+      } catch {
+        logScanner("error", "Failed to record authorization status", { email });
+      }
+    }
+    result.error = error instanceof GmailOAuthError ? error.message : "Could not finish the Gmail scan.";
+    logScanner("error", "Gmail API scan failed", { email, error: result.error });
+  }
+
+  return result;
+}
+
+export async function scanAllGmailAccounts(): Promise<ScanGmailResult> {
+  const legacy = parseGmailAccountsFromEnvDetailed();
+  const config = getGmailOAuthConfig();
+  const scans = new Map<string, () => Promise<AccountScanResult>>();
+
+  if (config) {
+    const connections = await prisma.gmailConnection.findMany({ orderBy: { email: "asc" } });
+    for (const connection of connections) {
+      scans.set(connection.email.toLowerCase(), () => scanOAuthAccount(config, connection));
+    }
+  }
+
+  for (const account of legacy.accounts) {
+    const key = account.email.toLowerCase();
+    if (!scans.has(key)) {
+      scans.set(key, () => scanAccount(account));
+    }
+  }
+
+  const jobs = [...scans.values()];
+  const accounts: AccountScanResult[] = [];
+  let nextJob = 0;
+  await Promise.all(Array.from({ length: Math.min(CONCURRENT_ACCOUNT_SCANS, jobs.length) }, async () => {
+    while (nextJob < jobs.length) {
+      const index = nextJob++;
+      accounts[index] = await jobs[index]();
+    }
+  }));
+
   return {
-    success: true,
-    scannedAccounts: accountsOut.length,
-    inserted,
-    skipped,
-    accounts: accountsOut,
-    highlights,
+    success: accounts.some((account) => account.ok),
+    scannedAccounts: accounts.length,
+    configurationError: accounts.length === 0 ? legacy.error : undefined,
+    inserted: accounts.reduce((count, account) => count + account.inserted, 0),
+    skipped: accounts.reduce((count, account) => count + account.skipped, 0),
+    accounts,
+    highlights: accounts.flatMap((account) => account.highlights ?? []),
   };
 }
