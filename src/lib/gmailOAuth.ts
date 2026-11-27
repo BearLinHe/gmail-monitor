@@ -204,21 +204,30 @@ type GmailErrorBody = {
   };
 };
 
+type GmailReadOperation = "profile" | "message list" | "message metadata";
+
+function invalidGmailResponse(operation: GmailReadOperation, detail: string): GmailOAuthError {
+  return new GmailOAuthError(`Gmail returned an invalid ${operation} response (${detail}). Try again.`);
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 async function gmailGet<T>(
   accessToken: string,
   path: string,
+  operation: GmailReadOperation,
   query?: URLSearchParams,
-  allowNotFound = false,
 ): Promise<T | null> {
   const url = new URL(path, GMAIL_API_URL);
   if (query) url.search = query.toString();
   const response = await googleFetch(url, {
-    headers: { authorization: `Bearer ${accessToken}` },
+    headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" },
   });
-  if (response.status === 404 && allowNotFound) return null;
-  const result: unknown = await response.json().catch(() => null);
+  if (response.status === 404 && operation === "message metadata") return null;
   if (!response.ok) {
-    const body = result as GmailErrorBody | null;
+    const body = response.status === 403 ? (await response.json().catch(() => null)) as GmailErrorBody | null : null;
     const errors = body?.error?.errors;
     const details = body?.error?.details;
     const insufficientScope = response.status === 403 && (
@@ -233,15 +242,37 @@ async function gmailGet<T>(
     }
     throw new GmailOAuthError(`Gmail could not complete the request (HTTP ${response.status}).`);
   }
-  if (result === null || typeof result !== "object") {
-    throw new GmailOAuthError("Gmail returned an invalid response.");
+
+  let body: string;
+  try {
+    body = await response.text();
+  } catch {
+    throw invalidGmailResponse(operation, `could not read HTTP ${response.status} body`);
   }
+  if (!body.trim()) {
+    if (operation === "message list" && query?.has("fields")) {
+      // Confirm the same page with the full list response before treating it as empty.
+      const fullQuery = new URLSearchParams(query);
+      fullQuery.delete("fields");
+      return gmailGet<T>(accessToken, path, operation, fullQuery);
+    }
+    throw invalidGmailResponse(operation, `empty HTTP ${response.status} body`);
+  }
+
+  let result: unknown;
+  try {
+    result = JSON.parse(body);
+  } catch {
+    throw invalidGmailResponse(operation, `malformed JSON, HTTP ${response.status}`);
+  }
+  if (!isJsonObject(result)) throw invalidGmailResponse(operation, "expected a JSON object");
   return result as T;
 }
 
 export async function getGmailProfileEmail(accessToken: string): Promise<string> {
   const profile = await gmailGet<{ emailAddress?: string }>(
     accessToken,
+    "profile",
     "profile",
     new URLSearchParams({ fields: "emailAddress" }),
   );
@@ -251,9 +282,18 @@ export async function getGmailProfileEmail(accessToken: string): Promise<string>
 }
 
 type MessagePage = {
-  messages?: Array<{ id?: string }>;
+  messages?: Array<{ id: string }>;
   nextPageToken?: string;
 };
+
+function isMessagePage(page: Record<string, unknown>): page is Record<string, unknown> & MessagePage {
+  return (
+    (page.messages === undefined || (Array.isArray(page.messages) && page.messages.every(
+      (message: unknown) => isJsonObject(message) && typeof message.id === "string" && message.id.trim() !== "",
+    ))) &&
+    (page.nextPageToken === undefined || typeof page.nextPageToken === "string")
+  );
+}
 
 type MessageMetadata = {
   internalDate?: string;
@@ -279,7 +319,7 @@ async function getGmailMessageMetadata(
   for (const header of ["Subject", "From", "Message-ID"]) query.append("metadataHeaders", header);
 
   const message = await gmailGet<MessageMetadata>(
-    accessToken, `messages/${encodeURIComponent(id)}`, query, true,
+    accessToken, `messages/${encodeURIComponent(id)}`, "message metadata", query,
   );
   if (!message?.internalDate) return null;
   const receivedAt = new Date(Number(message.internalDate));
@@ -305,13 +345,14 @@ export async function listGmailRescheduleMessages(
   const query = new URLSearchParams({
     q: `after:${Math.floor(cutoffMs / 1000) - 1} subject:RESCHEDULE subject:Appointment`,
     maxResults: "500",
-    fields: "messages(id),nextPageToken",
+    fields: "messages(id),nextPageToken,resultSizeEstimate",
   });
   do {
-    const page = await gmailGet<MessagePage>(accessToken, "messages", query);
+    const page = await gmailGet<Record<string, unknown>>(accessToken, "messages", "message list", query);
+    if (!page || !isMessagePage(page)) throw invalidGmailResponse("message list", "unexpected fields");
     const ids: string[] = [];
-    for (const { id } of page?.messages ?? []) {
-      if (!id || seenIds.has(id)) continue;
+    for (const { id } of page.messages ?? []) {
+      if (seenIds.has(id)) continue;
       seenIds.add(id);
       ids.push(id);
     }
@@ -323,7 +364,7 @@ export async function listGmailRescheduleMessages(
       for (const message of batch) if (message) messages.push(message);
     }
 
-    const nextPage = page?.nextPageToken;
+    const nextPage = page.nextPageToken;
     if (!nextPage) break;
     if (seenPageTokens.has(nextPage)) {
       throw new GmailOAuthError("Gmail returned a repeated page token. Try again.");
